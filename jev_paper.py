@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
 jev_paper.py - paper trading test of the "Jev as judge" idea.
-NO wallet, NO real money, NO trading. It only reads public DexScreener data,
-asks Jev four questions per token and logs the verdicts to verdicts.csv.
+NO wallet, NO real money, NO trading. It only reads public data (DexScreener,
+RugCheck), asks Jev four questions per token and logs the verdicts to verdicts.csv.
 
-Commands (run in the folder with .env):
+Commands (run in the folder with .env, or on GitHub Actions):
   python3 jev_paper.py env       -> checks that the API key is loaded (never prints it)
   python3 jev_paper.py test      -> checks that the key works (GET /v1/models, costs nothing)
-  python3 jev_paper.py scan      -> finds fresh tokens, asks Jev, logs verdicts
-  python3 jev_paper.py check     -> for verdicts older than 24h, fills in the price change
+  python3 jev_paper.py scan      -> fills price snapshots, finds fresh tokens, asks Jev, logs verdicts
+  python3 jev_paper.py check     -> fills price snapshots (1h / 6h / 24h after each verdict)
   python3 jev_paper.py report    -> calibration table (run on Sunday)
-  python3 jev_paper.py selftest  -> offline test of the gate logic
+  python3 jev_paper.py testmail  -> writes a test notification (GitHub turns it into an e-mail)
+  python3 jev_paper.py selftest  -> offline test of the gate, RISK and snapshot logic
 """
 import csv
 import json
 import os
+import statistics
 import sys
 import time
 import urllib.error
@@ -24,11 +26,13 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(HERE, "verdicts.csv")
 STATE_PATH = os.path.join(HERE, "jev_state.json")
+NOTIFY_PATH = os.path.join(HERE, "notify.md")
 
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
 JEV_MODELS_URL = "https://api.typesafe.ai/v1/models"
 DEX = "https://api.dexscreener.com"
-UA = "jev-paper-test/1.0"
+RUGCHECK = "https://api.rugcheck.xyz/v1"
+UA = "jev-paper-test/1.1"
 
 # ---- THE GATE (placeholder numbers copied from the post - tune them on your own log) ----
 BUY_MIN_P = 0.70        # action = buy, probability at least this
@@ -37,15 +41,22 @@ LATE_MAX_P = 0.50       # late must be "no" (probability of yes below this)
 EXIT_RISK_MAX = 3       # exit_risk score 1-5, at most this
 WATCH_WAIT_MIN = 30     # minutes before a "watch" is asked again
 
-# ---- crude pre-filters (free data only; there is NO contract/rug check here) ----
+# ---- pre-filters ----
 MIN_LIQUIDITY_USD = 5000
 MAX_AGE_HOURS = 48
 MAX_PER_SCAN = 15
 
+# ---- paper-trading realism ----
+COST_PCT = 15.0         # assumed round-trip cost (slippage + fees) on small memecoins, in percent
+SNAPSHOTS = ((1, "1h"), (6, "6h"), (24, "24h"))
+MAX_CHECK_CALLS = 60    # max DexScreener calls per check run
+
 CSV_FIELDS = [
     "time_utc", "chain", "symbol", "token_address", "pair_address", "url",
     "price_usd", "liquidity_usd", "age_h", "action", "action_p", "organic_p",
-    "late_p", "exit_risk", "verdict", "reason", "price_24h", "change_24h_pct",
+    "late_p", "exit_risk", "verdict", "reason", "risk",
+    "price_1h", "change_1h_pct", "price_6h", "change_6h_pct",
+    "price_24h", "change_24h_pct",
 ]
 
 
@@ -92,6 +103,8 @@ def http_json(url, method="GET", body=None, headers=None, retries=2):
             raise RuntimeError("HTTP %s dla %s: %s" % (e.code, url.split("?")[0], detail))
         except urllib.error.URLError as e:
             raise RuntimeError("Brak polaczenia z %s: %s" % (url.split("/")[2], e.reason))
+        except ValueError as e:
+            raise RuntimeError("Odpowiedz z %s nie jest poprawnym JSON: %s" % (url.split("/")[2], e))
 
 
 def num(x, default=None):
@@ -103,6 +116,19 @@ def num(x, default=None):
 
 def fmt(x, nd=0):
     return "missing" if x is None else ("%.*f" % (nd, x))
+
+
+def pick(d, *names):
+    """First non-null value among several possible key names (camelCase / snake_case)."""
+    if isinstance(d, dict):
+        for n in names:
+            if d.get(n) is not None:
+                return d[n]
+    return None
+
+
+def has_key(d, *names):
+    return isinstance(d, dict) and any(n in d for n in names)
 
 
 def load_state():
@@ -167,7 +193,57 @@ def fresh_candidates():
     return out[:MAX_PER_SCAN]
 
 
-def dossier(pr):
+# ------------------------------------------------------------------ RISK (RugCheck, Solana only)
+def rugcheck_report(mint):
+    return http_json("%s/tokens/%s/report" % (RUGCHECK, mint))
+
+
+def assess_risk(rep):
+    """Returns (status, dossier_lines, dead_reasons).
+    status: 'ok' (no hard fail), 'dead' (one hard fail = dead), 'error' (unusable report)."""
+    if not (has_key(rep, "mintAuthority", "mint_authority") and
+            has_key(rep, "freezeAuthority", "freeze_authority")):
+        return "error", ["contract_risk_check: missing (unrecognised report format)"], []
+    mint = pick(rep, "mintAuthority", "mint_authority")
+    freeze = pick(rep, "freezeAuthority", "freeze_authority")
+    rugged = bool(pick(rep, "rugged"))
+    risks = [r for r in (pick(rep, "risks") or []) if isinstance(r, dict)]
+    holders = [h for h in (pick(rep, "topHolders", "top_holders") or []) if isinstance(h, dict)]
+    total = pick(rep, "totalHolders", "total_holders")
+    top10 = sum(num(h.get("pct"), 0) for h in holders[:10]) if holders else None
+    lp_vals = []
+    for m in pick(rep, "markets") or []:
+        v = pick(pick(m, "lp"), "lpLockedPct", "lp_locked_pct")
+        if num(v) is not None:
+            lp_vals.append(num(v))
+    lp_locked = max(lp_vals) if lp_vals else None
+    danger = [str(r.get("name")) for r in risks if str(r.get("level", "")).lower() == "danger"]
+    warn = [str(r.get("name")) for r in risks if str(r.get("level", "")).lower() == "warn"]
+
+    dead = []
+    if rugged:
+        dead.append("marked as rugged")
+    if mint:
+        dead.append("mint authority not renounced")
+    if freeze:
+        dead.append("freeze authority not renounced")
+    for d in danger:
+        dead.append("danger: " + d)
+
+    lines = [
+        "mint_authority: %s" % ("ACTIVE" if mint else "renounced"),
+        "freeze_authority: %s" % ("ACTIVE" if freeze else "renounced"),
+        "rugged_flag: %s" % ("yes" if rugged else "no"),
+        "total_holders: %s" % (total if total is not None else "missing"),
+        "top10_holders_pct: %s (as reported; may include liquidity pool accounts)" % fmt(top10, 1),
+        "lp_locked_pct: %s" % fmt(lp_locked, 1),
+        "risk_warnings: %s" % (", ".join(warn) if warn else "none"),
+        "risk_dangers: %s" % (", ".join(danger) if danger else "none"),
+    ]
+    return ("dead" if dead else "ok"), lines, dead
+
+
+def dossier(pr, risk_lines=None):
     t = pr.get("txns") or {}
     v = pr.get("volume") or {}
     c = pr.get("priceChange") or {}
@@ -191,12 +267,15 @@ def dossier(pr):
         "volume_usd: 1h %s, 6h %s, 24h %s" % (
             fmt(num(v.get("h1"))), fmt(num(v.get("h6"))), fmt(num(v.get("h24")))),
         "holders_now_vs_1h_ago: missing",
-        "top10_holders_share: missing",
         "dev_wallet_share: missing",
-        "contract_risk_check: missing (not run)",
-        "smart_money_check: missing (not run)",
-        "social_mentions_per_hour: missing",
     ]
+    if risk_lines:
+        lines.extend(risk_lines)
+    else:
+        lines.append("contract_risk_check: missing (not run)")
+        lines.append("top10_holders_share: missing")
+    lines.append("smart_money_check: missing (not run)")
+    lines.append("social_mentions_per_hour: missing")
     return "\n".join(lines)
 
 
@@ -250,8 +329,8 @@ def ask_jev(state_text):
     return resp.get("answers") or {}
 
 
-def decide(ans, was_watch=False):
-    """The fixed gate. Returns (verdict, reason, numbers)."""
+def _gate(ans, was_watch=False):
+    """The fixed gate on Jev's answers. Returns (verdict, reason, numbers)."""
     try:
         act = ans["action"]
         action = act["choice"]
@@ -283,6 +362,56 @@ def decide(ans, was_watch=False):
     return "pass", "action = pass", nums
 
 
+def decide(ans, was_watch=False, risk="ok"):
+    """Gate + RISK rule: a BUY needs a clean RISK check (so only checked Solana tokens can be BUY)."""
+    verdict, reason, nums = _gate(ans, was_watch)
+    if verdict == "buy" and risk != "ok":
+        return "pass", "no clean RISK check (risk=%s)" % risk, nums
+    return verdict, reason, nums
+
+
+# ------------------------------------------------------------------ snapshots
+def fill_snapshots(row, price_now, age_h):
+    """Fills price/change columns for 1h, 6h, 24h once the verdict is old enough.
+    price_now=None means the pair is gone (treated as dead). Returns how many were filled."""
+    p0 = num(row.get("price_usd"))
+    filled = 0
+    for hours, label in SNAPSHOTS:
+        if age_h >= hours and not row.get("price_" + label):
+            if price_now is None:
+                row["price_" + label] = "0"
+                row["change_%s_pct" % label] = "-100"
+            elif p0:
+                row["price_" + label] = str(price_now)
+                row["change_%s_pct" % label] = "%.1f" % ((price_now / p0 - 1) * 100)
+            else:
+                continue
+            filled += 1
+    return filled
+
+
+def row_age_h(row, now):
+    t = datetime.strptime(row["time_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    return (now - t).total_seconds() / 3600.0
+
+
+# ------------------------------------------------------------------ notification
+def write_notify(buys):
+    owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "")
+    syms = ", ".join(b["symbol"] for b in buys)
+    lines = ["# BUY (test papierowy): %s" % syms, "",
+             ("@%s " % owner if owner else "") + "Sedzia dal BUY. To zapis testowy, NIE rekomendacja.", ""]
+    for b in buys:
+        lines.append("- **%s** (%s), cena %s USD, plynnosc %s USD, wiek %.1f h, "
+                     "action_p %.2f, organic_p %.2f, late_p %.2f, exit_risk %.1f - [DexScreener](%s)" % (
+                         b["symbol"], b["chain"], b["price"], b["liq"], b["age"],
+                         b["action_p"], b["organic_p"], b["late_p"], b["exit_risk"], b["url"]))
+    lines += ["", "Przed jakakolwiek decyzja sprawdz kontrakt recznie (rugcheck.xyz) i pamietaj o "
+                  "poslizgu oraz oplatach (zalozenie testu: %d%% na wejscie i wyjscie)." % int(COST_PCT)]
+    with open(NOTIFY_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 # ------------------------------------------------------------------ commands
 def cmd_env():
     key = api_key()
@@ -294,7 +423,46 @@ def cmd_test():
     print("OK: Jev przyjal klucz.")
 
 
+def cmd_testmail():
+    owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "")
+    with open(NOTIFY_PATH, "w", encoding="utf-8") as f:
+        f.write("# Test powiadomienia (jev-paper)\n\n%sTo jest probne powiadomienie. Jesli widzisz "
+                "ten mail, powiadomienia o BUY dzialaja.\n" % ("@%s " % owner if owner else ""))
+    print("Zapisano notify.md (workflow zamieni go w Issue, a GitHub wysle mail).")
+
+
+def cmd_check():
+    rows = read_rows()
+    now = datetime.now(timezone.utc)
+    calls = filled = 0
+    for r in rows:
+        if calls >= MAX_CHECK_CALLS:
+            break
+        try:
+            age = row_age_h(r, now)
+        except (KeyError, ValueError):
+            continue
+        due = any(age >= h and not r.get("price_" + lab) for h, lab in SNAPSHOTS)
+        if not due or not r.get("pair_address") or not num(r.get("price_usd")):
+            continue
+        try:
+            data = http_json("%s/latest/dex/pairs/%s/%s" % (DEX, r["chain"], r["pair_address"]))
+        except RuntimeError:
+            continue
+        calls += 1
+        pairs = (data or {}).get("pairs") or []
+        price_now = num(pairs[0].get("priceUsd")) if pairs else None
+        filled += fill_snapshots(r, price_now, age)
+        time.sleep(0.25)
+    write_rows(rows)
+    print("Snapshoty cen: uzupelniono %d pol (%d zapytan)." % (filled, calls))
+
+
 def cmd_scan():
+    try:
+        cmd_check()
+    except RuntimeError as e:
+        print("check pominiety: %s" % e)
     st = load_state()
     rows = read_rows()
     now = datetime.now(timezone.utc)
@@ -302,9 +470,11 @@ def cmd_scan():
     print("Kandydaci po filtrach (wiek <= %dh, plynnosc >= %d USD): %d" % (
         MAX_AGE_HOURS, MIN_LIQUIDITY_USD, len(cands)))
     counts = {"buy": 0, "watch": 0, "pass": 0}
+    buys = []
     for pr in cands:
         chain = pr.get("chainId")
         tok = (pr.get("baseToken") or {}).get("address")
+        sym = (pr.get("baseToken") or {}).get("symbol", "")
         key = "%s:%s" % (chain, tok)
         was_watch = False
         if key in st["watch"]:
@@ -314,12 +484,26 @@ def cmd_scan():
             was_watch = True
         elif key in st["seen"]:
             continue
-        try:
-            ans = ask_jev(dossier(pr))
-        except RuntimeError as e:
-            print("  Jev blad (%s) -> pass" % e)
-            ans = {}
-        verdict, reason, n = decide(ans, was_watch)
+
+        risk, risk_lines, dead = "n/a", None, []
+        if chain == "solana":
+            try:
+                risk, risk_lines, dead = assess_risk(rugcheck_report(tok))
+            except RuntimeError as e:
+                print("  RISK blad (%s)" % str(e)[:120])
+                risk, risk_lines = "error", ["contract_risk_check: missing (check failed)"]
+            time.sleep(0.5)
+
+        if risk == "dead":
+            verdict, reason, n = "pass", "RISK dead: " + "; ".join(dead), {}
+        else:
+            try:
+                ans = ask_jev(dossier(pr, risk_lines))
+            except RuntimeError as e:
+                print("  Jev blad (%s) -> pass" % e)
+                ans = {}
+            verdict, reason, n = decide(ans, was_watch, risk)
+
         counts[verdict] += 1
         if verdict == "watch":
             st["watch"][key] = now.isoformat()
@@ -328,107 +512,129 @@ def cmd_scan():
             st["seen"][key] = now.isoformat()
             rows.append({
                 "time_utc": now.strftime("%Y-%m-%d %H:%M:%S"), "chain": chain,
-                "symbol": (pr.get("baseToken") or {}).get("symbol", ""), "token_address": tok,
+                "symbol": sym, "token_address": tok,
                 "pair_address": pr.get("pairAddress", ""), "url": pr.get("url", ""),
                 "price_usd": pr.get("priceUsd", ""),
                 "liquidity_usd": (pr.get("liquidity") or {}).get("usd", ""),
                 "age_h": round(pr["_age_h"], 1), "action": n.get("action", ""),
                 "action_p": n.get("action_p", ""), "organic_p": n.get("organic_p", ""),
                 "late_p": n.get("late_p", ""), "exit_risk": n.get("exit_risk", ""),
-                "verdict": verdict, "reason": reason,
+                "verdict": verdict, "reason": reason, "risk": risk,
             })
-        print("  %-10s %-8s -> %s (%s)" % ((pr.get("baseToken") or {}).get("symbol", "?")[:10],
-                                         chain, verdict.upper(), reason))
+            if verdict == "buy":
+                buys.append({"symbol": sym, "chain": chain, "price": pr.get("priceUsd", "?"),
+                             "liq": (pr.get("liquidity") or {}).get("usd", "?"),
+                             "age": pr["_age_h"], "url": pr.get("url", ""),
+                             "action_p": n["action_p"], "organic_p": n["organic_p"],
+                             "late_p": n["late_p"], "exit_risk": n["exit_risk"]})
+        print("  %-10s %-8s -> %s (%s)" % (sym[:10], chain, verdict.upper(), reason[:80]))
         time.sleep(0.3)
     write_rows(rows)
     save_state(st)
+    if buys:
+        write_notify(buys)
     print("Razem: buy %d, watch %d, pass %d. Zapisano do verdicts.csv" % (
         counts["buy"], counts["watch"], counts["pass"]))
 
 
-def cmd_check():
-    rows = read_rows()
-    now = datetime.now(timezone.utc)
-    todo = []
-    for r in rows:
-        if r.get("price_24h"):
-            continue
-        t = datetime.strptime(r["time_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        if now - t >= timedelta(hours=24) and r.get("pair_address"):
-            todo.append(r)
-    done = 0
-    for r in todo:
-        try:
-            data = http_json("%s/latest/dex/pairs/%s/%s" % (DEX, r["chain"], r["pair_address"]))
-            pairs = data.get("pairs") or []
-            p = num(pairs[0].get("priceUsd")) if pairs else None
-        except RuntimeError:
-            continue
-        p0 = num(r.get("price_usd"))
-        if p is None:
-            r["price_24h"] = "0"       # pair gone from DexScreener = treat as dead
-            r["change_24h_pct"] = "-100"
-        elif p0:
-            r["price_24h"] = str(p)
-            r["change_24h_pct"] = "%.1f" % ((p / p0 - 1) * 100)
-        done += 1
-        time.sleep(0.3)
-    write_rows(rows)
-    print("Uzupelniono wynik 24h dla %d wpisow (z %d czekajacych)." % (done, len(todo)))
+def _stats_row(label, name, vals):
+    n = len(vals)
+    if not n:
+        print("%-8s %-6s %5d %10s %9s %13s" % (label, name, 0, "-", "-", "-"))
+        return
+    green = sum(1 for x in vals if x > 0)
+    med = statistics.median(vals)
+    print("%-8s %-6s %5d %9.0f%% %8.1f%% %12.1f%%" % (
+        label, name, n, 100.0 * green / n, med, med - COST_PCT))
 
 
 def cmd_report():
-    rows = [r for r in read_rows() if r.get("change_24h_pct") not in ("", None)]
-    if not rows:
-        print("Brak wpisow ze znanym wynikiem 24h. Uruchom 'scan' kilka razy, odczekaj 24h i uruchom 'check'.")
+    rows = read_rows()
+    if not any(r.get("change_1h_pct") not in ("", None) or r.get("change_24h_pct") not in ("", None)
+               for r in rows):
+        print("Brak wpisow ze znanym wynikiem. Poczekaj kilka godzin na snapshoty cen.")
         return
-
-    def stats(sel):
-        n = len(sel)
-        green = sum(1 for r in sel if num(r["change_24h_pct"], 0) > 0)
-        return n, green
-
-    print("Wynik = czy cena po 24h jest wyzsza niz w chwili werdyktu (to NIE jest zysk po oplatach).")
-    print("%-22s %6s %6s %8s" % ("grupa", "ilosc", "zielone", "% zielonych"))
-    buys = [r for r in rows if r["verdict"] == "buy"]
-    for name, lo, hi in (("buy 0.70-0.79", 0.70, 0.80), ("buy 0.80-0.89", 0.80, 0.90), ("buy 0.90+", 0.90, 1.01)):
-        sel = [r for r in buys if lo <= (num(r["action_p"], 0)) < hi]
-        n, g = stats(sel)
-        print("%-22s %6d %6d %8s" % (name, n, g, ("%.0f%%" % (100.0 * g / n)) if n else "-"))
-    n, g = stats([r for r in rows if r["verdict"] == "pass"])
-    print("%-22s %6d %6d %8s" % ("pass (wszystkie)", n, g, ("%.0f%%" % (100.0 * g / n)) if n else "-"))
-    print("\nJesli 0.90+ nie wygrywa czesciej niz 0.70-0.79, sedzia nie jest skalibrowany. "
+    print("Wynik = zmiana ceny od chwili werdyktu (to NIE jest zysk po oplatach).")
+    print("Kolumna 'po kosztach' odejmuje zalozone %d%% (poslizg + oplaty)." % int(COST_PCT))
+    print("%-8s %-6s %5s %10s %9s %13s" % ("horyzont", "grupa", "ilosc", "zielone", "mediana", "po kosztach"))
+    for _, label in SNAPSHOTS:
+        col = "change_%s_pct" % label
+        for name in ("buy", "pass"):
+            vals = [num(r[col]) for r in rows
+                    if r.get("verdict") == name and num(r.get(col)) is not None]
+            _stats_row(label, name, vals)
+    print("\nKalibracja (wynik po 24h, tylko BUY):")
+    print("%-16s %5s %7s" % ("przedzial action_p", "ilosc", "zielone"))
+    buys = [r for r in rows if r.get("verdict") == "buy" and num(r.get("change_24h_pct")) is not None]
+    for name, lo, hi in (("0.70-0.79", 0.70, 0.80), ("0.80-0.89", 0.80, 0.90), ("0.90+", 0.90, 1.01)):
+        sel = [r for r in buys if lo <= num(r.get("action_p"), 0) < hi]
+        g = sum(1 for r in sel if num(r["change_24h_pct"], 0) > 0)
+        print("%-16s %5d %7s" % (name, len(sel), ("%d/%d" % (g, len(sel))) if sel else "-"))
+    print("\nOpoznienie: porownaj mediane BUY po 1h, 6h i 24h. Jesli sygnal gasnie w ciagu godzin, "
+          "reczne zatwierdzanie raz na kilka godzin nie wystarczy.")
+    print("Jesli 0.90+ nie wygrywa czesciej niz 0.70-0.79, sedzia nie jest skalibrowany. "
           "Nie tlumacz tego - zmien progi albo pytanie.")
 
 
 def cmd_selftest():
+    bad = [0]
+
+    def check(name, got, expect):
+        ok = got == expect
+        bad[0] += 0 if ok else 1
+        print("%s  %-44s oczekiwano %-6s dostano %-6s" % ("OK " if ok else "BLAD", name, expect, got))
+
     def mk(action, ap, org, late, risk0):
         return {"action": {"choice": action, "probabilities": {action: ap}},
                 "organic": {"noul": org}, "late": {"noul": late}, "exit_risk": {"score": risk0}}
-    cases = [
-        (mk("buy", 0.82, 0.80, 0.20, 1.0), False, "buy"),
-        (mk("buy", 0.69, 0.80, 0.20, 1.0), False, "pass"),      # action_p too low
-        (mk("buy", 0.90, 0.60, 0.20, 1.0), False, "pass"),      # organic too low
-        (mk("buy", 0.90, 0.90, 0.70, 1.0), False, "pass"),      # late
-        (mk("buy", 0.90, 0.90, 0.20, 3.0), False, "pass"),      # exit_risk 4 > 3
-        (mk("buy", 0.90, 0.90, 0.20, 2.0), False, "buy"),       # exit_risk 3 ok
-        (mk("watch", 0.80, 0.80, 0.20, 1.0), False, "watch"),
-        (mk("watch", 0.80, 0.80, 0.20, 1.0), True, "pass"),     # second watch
-        (mk("pass", 0.95, 0.80, 0.20, 1.0), False, "pass"),
-        ({}, False, "pass"),                                    # no answer
-    ]
-    bad = 0
-    for ans, was_watch, expect in cases:
-        got = decide(ans, was_watch)[0]
-        ok = got == expect
-        bad += 0 if ok else 1
-        print("%s  oczekiwano %-5s dostano %-5s" % ("OK " if ok else "BLAD", expect, got))
-    print("Selftest: %s" % ("wszystko dziala" if not bad else "%d bledow" % bad))
-    sys.exit(1 if bad else 0)
+
+    # gate
+    check("gate: czysty buy", decide(mk("buy", 0.82, 0.80, 0.20, 1.0))[0], "buy")
+    check("gate: action_p za niskie", decide(mk("buy", 0.69, 0.80, 0.20, 1.0))[0], "pass")
+    check("gate: organic za niskie", decide(mk("buy", 0.90, 0.60, 0.20, 1.0))[0], "pass")
+    check("gate: late", decide(mk("buy", 0.90, 0.90, 0.70, 1.0))[0], "pass")
+    check("gate: exit_risk 4", decide(mk("buy", 0.90, 0.90, 0.20, 3.0))[0], "pass")
+    check("gate: exit_risk 3 ok", decide(mk("buy", 0.90, 0.90, 0.20, 2.0))[0], "buy")
+    check("gate: pierwszy watch", decide(mk("watch", 0.80, 0.80, 0.20, 1.0))[0], "watch")
+    check("gate: drugi watch", decide(mk("watch", 0.80, 0.80, 0.20, 1.0), True)[0], "pass")
+    check("gate: pass", decide(mk("pass", 0.95, 0.80, 0.20, 1.0))[0], "pass")
+    check("gate: brak odpowiedzi", decide({})[0], "pass")
+    # RISK rule
+    good = mk("buy", 0.90, 0.90, 0.20, 1.0)
+    check("risk: buy bez sprawdzenia RISK (n/a)", decide(good, False, "n/a")[0], "pass")
+    check("risk: buy z bledem RISK", decide(good, False, "error")[0], "pass")
+    check("risk: buy z czystym RISK", decide(good, False, "ok")[0], "buy")
+    # assess_risk
+    base = {"mintAuthority": None, "freezeAuthority": None, "rugged": False, "risks": [],
+            "topHolders": [{"pct": 5}, {"pct": 3}], "totalHolders": 120,
+            "markets": [{"lp": {"lpLockedPct": 100}}]}
+    check("assess: czysty raport", assess_risk(base)[0], "ok")
+    check("assess: mint authority aktywne", assess_risk(dict(base, mintAuthority="abc"))[0], "dead")
+    check("assess: freeze authority aktywne", assess_risk(dict(base, freezeAuthority="abc"))[0], "dead")
+    check("assess: rugged", assess_risk(dict(base, rugged=True))[0], "dead")
+    check("assess: ryzyko danger", assess_risk(dict(base, risks=[{"name": "X", "level": "danger"}]))[0], "dead")
+    check("assess: ryzyko warn to jeszcze ok", assess_risk(dict(base, risks=[{"name": "X", "level": "warn"}]))[0], "ok")
+    snake = {"mint_authority": None, "freeze_authority": None, "rugged": False, "risks": []}
+    check("assess: nazwy snake_case", assess_risk(snake)[0], "ok")
+    check("assess: nieznany format", assess_risk({"foo": 1})[0], "error")
+    # snapshots
+    r = {"price_usd": "1.0"}
+    check("snapshot: za wczesnie", fill_snapshots(r, 1.1, 0.5), 0)
+    check("snapshot: po 1.5h", fill_snapshots(r, 1.1, 1.5), 1)
+    check("snapshot: zmiana 1h", r.get("change_1h_pct"), "10.0")
+    check("snapshot: pair zniknal po 25h", fill_snapshots(r, None, 25), 2)
+    check("snapshot: 24h = -100", r.get("change_24h_pct"), "-100")
+    check("snapshot: 1h nie nadpisane", r.get("change_1h_pct"), "10.0")
+    # dossier contains RISK facts
+    d = dossier({"chainId": "solana", "baseToken": {"symbol": "T"}, "_age_h": 2.0}, ["mint_authority: renounced"])
+    check("dossier: zawiera linie RISK", "mint_authority: renounced" in d, True)
+    check("dossier bez RISK: oznaczone missing", "contract_risk_check: missing (not run)" in dossier({}), True)
+    print("Selftest: %s" % ("wszystko dziala" if not bad[0] else "%d bledow" % bad[0]))
+    sys.exit(1 if bad[0] else 0)
 
 
 COMMANDS = {"env": cmd_env, "test": cmd_test, "scan": cmd_scan, "check": cmd_check,
-            "report": cmd_report, "selftest": cmd_selftest}
+            "report": cmd_report, "testmail": cmd_testmail, "selftest": cmd_selftest}
 
 if __name__ == "__main__":
     load_env()

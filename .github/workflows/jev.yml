@@ -2,17 +2,17 @@ name: jev-paper
 
 on:
   schedule:
-    - cron: "17 */2 * * *"   # scan co 2 godziny
-    - cron: "40 6 * * *"     # check codziennie (UTC)
+    - cron: "17 * * * *"     # scan co godzine (zawiera uzupelnianie snapshotow 1h/6h/24h)
     - cron: "0 18 * * 0"     # report w niedziele (UTC)
   workflow_dispatch:
     inputs:
       command:
-        description: "scan, check albo report"
+        description: "scan, check, report albo testmail"
         default: "scan"
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: jev-paper
@@ -39,10 +39,8 @@ jobs:
           NAME="scan"
           if [ "$EVENT" = "workflow_dispatch" ]; then
             case "$INPUT_CMD" in
-              scan|check|report) NAME="$INPUT_CMD" ;;
+              scan|check|report|testmail) NAME="$INPUT_CMD" ;;
             esac
-          elif [ "$SCHEDULE" = "40 6 * * *" ]; then
-            NAME="check"
           elif [ "$SCHEDULE" = "0 18 * * 0" ]; then
             NAME="report"
           fi
@@ -51,6 +49,7 @@ jobs:
       - name: Uruchom
         env:
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           CMD: ${{ steps.cmd.outputs.name }}
         run: |
           if [ "$CMD" = "report" ]; then
@@ -68,5 +67,14 @@ jobs:
             echo "Brak zmian"
           else
             git commit -m "jev-paper: ${{ steps.cmd.outputs.name }}"
+            git pull --rebase -q || true
             git push
           fi
+
+      - name: Powiadom mailem (Issue z oznaczeniem wlasciciela)
+        if: ${{ hashFiles('notify.md') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="$(head -n1 notify.md | sed 's/^# //')"
+          gh issue create --title "$TITLE" --body-file notify.md
