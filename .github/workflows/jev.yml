@@ -78,3 +78,11 @@ jobs:
         run: |
           TITLE="$(head -n1 notify.md | sed 's/^# //')"
           gh issue create --title "$TITLE" --body-file notify.md
+
+      - name: Raport tygodniowy mailem (Issue)
+        if: ${{ steps.cmd.outputs.name == 'report' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo "@${{ github.repository_owner }} Raport tygodniowy (test papierowy, nie rekomendacja):"; echo; echo '```'; cat report.txt; echo '```'; } > report.md
+          gh issue create --title "Raport tygodniowy jev-paper" --body-file report.md
