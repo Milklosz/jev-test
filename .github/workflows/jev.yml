@@ -1,0 +1,72 @@
+name: jev-paper
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"   # scan co 2 godziny
+    - cron: "40 6 * * *"     # check codziennie (UTC)
+    - cron: "0 18 * * 0"     # report w niedziele (UTC)
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "scan, check albo report"
+        default: "scan"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jev-paper
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Wybierz komende
+        id: cmd
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_CMD: ${{ github.event.inputs.command }}
+        run: |
+          NAME="scan"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            case "$INPUT_CMD" in
+              scan|check|report) NAME="$INPUT_CMD" ;;
+            esac
+          elif [ "$SCHEDULE" = "40 6 * * *" ]; then
+            NAME="check"
+          elif [ "$SCHEDULE" = "0 18 * * 0" ]; then
+            NAME="report"
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Uruchom
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          CMD: ${{ steps.cmd.outputs.name }}
+        run: |
+          if [ "$CMD" = "report" ]; then
+            python jev_paper.py report | tee report.txt
+          else
+            python jev_paper.py "$CMD"
+          fi
+
+      - name: Zapisz wyniki w repozytorium
+        run: |
+          git config user.name "jev-bot"
+          git config user.email "jev-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Brak zmian"
+          else
+            git commit -m "jev-paper: ${{ steps.cmd.outputs.name }}"
+            git push
+          fi
