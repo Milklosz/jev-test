@@ -2,7 +2,7 @@ name: jev-paper
 
 on:
   schedule:
-    - cron: "7,37 * * * *"    # scan co 30 min (repo publiczne = darmowe minuty)
+    - cron: "*/15 * * * *"    # scan co 15 min (repo publiczne = darmowe minuty)
     - cron: "0 18 * * 0"     # report w niedziele (UTC)
   workflow_dispatch:
     inputs:

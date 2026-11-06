@@ -44,7 +44,7 @@ WATCH_WAIT_MIN = 30     # minutes before a "watch" is asked again
 # ---- pre-filters ----
 MIN_LIQUIDITY_USD = 5000
 MAX_AGE_HOURS = 48
-MAX_PER_SCAN = 15
+MAX_PER_SCAN = 25
 
 # ---- paper-trading realism ----
 COST_PCT = 15.0         # assumed round-trip cost (slippage + fees) on small memecoins, in percent
@@ -161,10 +161,20 @@ def write_rows(rows):
 # ------------------------------------------------------------------ dexscreener
 def fresh_candidates():
     """Latest token profiles -> best pair per token, filtered by age and liquidity."""
-    profiles = http_json(DEX + "/token-profiles/latest/v1")
-    by_chain = {}
-    for p in profiles:
-        by_chain.setdefault(p.get("chainId"), []).append(p.get("tokenAddress"))
+    sources = []
+    for path in ("/token-profiles/latest/v1", "/token-boosts/latest/v1"):
+        try:
+            sources.extend(http_json(DEX + path) or [])
+        except RuntimeError as e:
+            print("zrodlo %s pominiete: %s" % (path, str(e)[:100]))
+        time.sleep(0.3)
+    by_chain, seen_tok = {}, set()
+    for p in sources:
+        ch, ad = p.get("chainId"), p.get("tokenAddress")
+        if not ch or not ad or (ch, ad) in seen_tok:
+            continue
+        seen_tok.add((ch, ad))
+        by_chain.setdefault(ch, []).append(ad)
     now_ms = time.time() * 1000
     out = []
     for chain, addrs in by_chain.items():
