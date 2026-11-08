@@ -47,6 +47,11 @@ MAX_AGE_HOURS = 48
 MAX_PER_SCAN = 25
 
 # ---- paper-trading realism ----
+# ---- second test ("luzna bramka"): the SAME Jev answers, judged by a looser gate ----
+# Jev has never answered "buy" in the main test, so the loose gate accepts "watch" too.
+LOOSE_ORGANIC_MIN = 0.50
+LOOSE_LATE_MAX = 0.80
+LOOSE_EXIT_RISK_MAX = 4
 COST_PCT = 15.0         # assumed round-trip cost (slippage + fees) on small memecoins, in percent
 SNAPSHOTS = ((1, "1h"), (6, "6h"), (24, "24h"))
 MAX_CHECK_CALLS = 60    # max DexScreener calls per check run
@@ -56,7 +61,7 @@ CSV_FIELDS = [
     "price_usd", "liquidity_usd", "age_h", "action", "action_p", "organic_p",
     "late_p", "exit_risk", "verdict", "reason", "risk",
     "price_1h", "change_1h_pct", "price_6h", "change_6h_pct",
-    "price_24h", "change_24h_pct",
+    "price_24h", "change_24h_pct", "buy_p", "verdict_loose",
 ]
 
 
@@ -350,7 +355,8 @@ def _gate(ans, was_watch=False):
         exit_risk = num(ans["exit_risk"]["score"]) + 1  # Jev scores are 0-based
     except (KeyError, TypeError):
         return "pass", "no answer from Jev (no answer is not a yes)", {}
-    nums = {"action": action, "action_p": action_p, "organic_p": organic_p,
+    nums = {"action": action, "buy_p": num((act.get("probabilities") or {}).get("buy")),
+            "action_p": action_p, "organic_p": organic_p,
             "late_p": late_p, "exit_risk": exit_risk}
     if None in (action_p, organic_p, late_p, exit_risk):
         return "pass", "incomplete answer", nums
@@ -370,6 +376,17 @@ def _gate(ans, was_watch=False):
             return "pass", "second watch = pass", nums
         return "watch", "ask again in %d min" % WATCH_WAIT_MIN, nums
     return "pass", "action = pass", nums
+
+
+def loose_verdict(action, organic_p, late_p, exit_risk, risk):
+    """Second test: same answers, looser gate. 'buy' or 'pass' (never sends mail)."""
+    if None in (organic_p, late_p, exit_risk) or action not in ("buy", "watch"):
+        return "pass"
+    if risk != "ok":
+        return "pass"
+    if organic_p >= LOOSE_ORGANIC_MIN and late_p < LOOSE_LATE_MAX and exit_risk <= LOOSE_EXIT_RISK_MAX:
+        return "buy"
+    return "pass"
 
 
 def decide(ans, was_watch=False, risk="ok"):
@@ -530,6 +547,9 @@ def cmd_scan():
                 "action_p": n.get("action_p", ""), "organic_p": n.get("organic_p", ""),
                 "late_p": n.get("late_p", ""), "exit_risk": n.get("exit_risk", ""),
                 "verdict": verdict, "reason": reason, "risk": risk,
+                "buy_p": n.get("buy_p", ""),
+                "verdict_loose": loose_verdict(n.get("action"), n.get("organic_p"), n.get("late_p"),
+                                               n.get("exit_risk"), risk) if n else "pass",
             })
             if verdict == "buy":
                 buys.append({"symbol": sym, "chain": chain, "price": pr.get("priceUsd", "?"),
@@ -569,10 +589,14 @@ def cmd_report():
     print("%-8s %-6s %5s %10s %9s %13s" % ("horyzont", "grupa", "ilosc", "zielone", "mediana", "po kosztach"))
     for _, label in SNAPSHOTS:
         col = "change_%s_pct" % label
-        for name in ("buy", "pass"):
+        for name, key, want in (("buy", "verdict", "buy"), ("luzny", "verdict_loose", "buy"),
+                                ("pass", "verdict", "pass")):
             vals = [num(r[col]) for r in rows
-                    if r.get("verdict") == name and num(r.get(col)) is not None]
+                    if r.get(key) == want and num(r.get(col)) is not None]
             _stats_row(label, name, vals)
+    print("grupa 'luzny' = ta sama odpowiedz Jeva oceniona luzniejsza bramka "
+          "(action buy/watch, organic>=%.2f, late<%.2f, exit_risk<=%d, RISK ok); drugi test." % (
+              LOOSE_ORGANIC_MIN, LOOSE_LATE_MAX, LOOSE_EXIT_RISK_MAX))
     print("\nKalibracja (wynik po 24h, tylko BUY):")
     print("%-16s %5s %7s" % ("przedzial action_p", "ilosc", "zielone"))
     buys = [r for r in rows if r.get("verdict") == "buy" and num(r.get("change_24h_pct")) is not None]
@@ -609,6 +633,12 @@ def cmd_selftest():
     check("gate: drugi watch", decide(mk("watch", 0.80, 0.80, 0.20, 1.0), True)[0], "pass")
     check("gate: pass", decide(mk("pass", 0.95, 0.80, 0.20, 1.0))[0], "pass")
     check("gate: brak odpowiedzi", decide({})[0], "pass")
+    # loose gate (second test)
+    check("luzny: watch przechodzi", loose_verdict("watch", 0.55, 0.70, 3.0, "ok"), "buy")
+    check("luzny: pass nie przechodzi", loose_verdict("pass", 0.90, 0.10, 1.0, "ok"), "pass")
+    check("luzny: za niskie organic", loose_verdict("watch", 0.40, 0.10, 1.0, "ok"), "pass")
+    check("luzny: za pozno", loose_verdict("buy", 0.80, 0.85, 1.0, "ok"), "pass")
+    check("luzny: wymaga RISK ok", loose_verdict("buy", 0.80, 0.10, 1.0, "n/a"), "pass")
     # RISK rule
     good = mk("buy", 0.90, 0.90, 0.20, 1.0)
     check("risk: buy bez sprawdzenia RISK (n/a)", decide(good, False, "n/a")[0], "pass")
