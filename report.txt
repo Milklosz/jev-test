@@ -1,0 +1,22 @@
+Wynik = zmiana ceny od chwili werdyktu (to NIE jest zysk po oplatach).
+Kolumna 'po kosztach' odejmuje zalozone 15% (poslizg + oplaty).
+horyzont grupa  ilosc    zielone   mediana   po kosztach
+1h       buy        0          -         -             -
+1h       luzny      0          -         -             -
+1h       pass      68        26%    -39.3%        -54.3%
+6h       buy        0          -         -             -
+6h       luzny      0          -         -             -
+6h       pass      64        25%    -49.5%        -64.5%
+24h      buy        0          -         -             -
+24h      luzny      0          -         -             -
+24h      pass      55        20%    -63.0%        -78.0%
+grupa 'luzny' = ta sama odpowiedz Jeva oceniona luzniejsza bramka (action buy/watch, organic>=0.50, late<0.80, exit_risk<=4, RISK ok); drugi test.
+
+Kalibracja (wynik po 24h, tylko BUY):
+przedzial action_p ilosc zielone
+0.70-0.79            0       -
+0.80-0.89            0       -
+0.90+                0       -
+
+Opoznienie: porownaj mediane BUY po 1h, 6h i 24h. Jesli sygnal gasnie w ciagu godzin, reczne zatwierdzanie raz na kilka godzin nie wystarczy.
+Jesli 0.90+ nie wygrywa czesciej niz 0.70-0.79, sedzia nie jest skalibrowany. Nie tlumacz tego - zmien progi albo pytanie.
