@@ -2,14 +2,14 @@ Wynik = zmiana ceny od chwili werdyktu (to NIE jest zysk po oplatach).
 Kolumna 'po kosztach' odejmuje zalozone 15% (poslizg + oplaty).
 horyzont grupa  ilosc    zielone   mediana   po kosztach
 1h       buy        0          -         -             -
-1h       luzny      0          -         -             -
-1h       pass      68        26%    -39.3%        -54.3%
+1h       luzny      6        50%     -3.8%        -18.8%
+1h       pass     215        27%    -30.7%        -45.7%
 6h       buy        0          -         -             -
-6h       luzny      0          -         -             -
-6h       pass      64        25%    -49.5%        -64.5%
+6h       luzny      6        33%     -7.1%        -22.1%
+6h       pass     211        23%    -39.1%        -54.1%
 24h      buy        0          -         -             -
-24h      luzny      0          -         -             -
-24h      pass      55        20%    -63.0%        -78.0%
+24h      luzny      6        33%    -21.4%        -36.5%
+24h      pass     198        15%    -62.9%        -77.9%
 grupa 'luzny' = ta sama odpowiedz Jeva oceniona luzniejsza bramka (action buy/watch, organic>=0.50, late<0.80, exit_risk<=4, RISK ok); drugi test.
 
 Kalibracja (wynik po 24h, tylko BUY):
