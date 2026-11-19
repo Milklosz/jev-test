@@ -590,10 +590,12 @@ def cmd_report():
     for _, label in SNAPSHOTS:
         col = "change_%s_pct" % label
         for name, key, want in (("buy", "verdict", "buy"), ("luzny", "verdict_loose", "buy"),
-                                ("pass", "verdict", "pass")):
+                                ("rugchk", "risk", "ok"), ("pass", "verdict", "pass")):
             vals = [num(r[col]) for r in rows
                     if r.get(key) == want and num(r.get(col)) is not None]
             _stats_row(label, name, vals)
+    print("grupa 'rugchk' = WSZYSTKIE tokeny z czystym kontraktem (bez Jeva): porownaj z 'luzny', "
+          "zeby zobaczyc, czy Jev cos dodaje ponad sama kontrole kontraktu.")
     print("grupa 'luzny' = ta sama odpowiedz Jeva oceniona luzniejsza bramka "
           "(action buy/watch, organic>=%.2f, late<%.2f, exit_risk<=%d, RISK ok); drugi test." % (
               LOOSE_ORGANIC_MIN, LOOSE_LATE_MAX, LOOSE_EXIT_RISK_MAX))
