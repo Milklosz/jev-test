@@ -2,14 +2,18 @@ Wynik = zmiana ceny od chwili werdyktu (to NIE jest zysk po oplatach).
 Kolumna 'po kosztach' odejmuje zalozone 15% (poslizg + oplaty).
 horyzont grupa  ilosc    zielone   mediana   po kosztach
 1h       buy        0          -         -             -
-1h       luzny      6        50%     -3.8%        -18.8%
-1h       pass     215        27%    -30.7%        -45.7%
+1h       luzny      8        50%     -3.1%        -18.1%
+1h       rugchk   124        25%    -37.3%        -52.3%
+1h       pass     338        31%    -29.9%        -44.9%
 6h       buy        0          -         -             -
-6h       luzny      6        33%     -7.1%        -22.1%
-6h       pass     211        23%    -39.1%        -54.1%
+6h       luzny      8        38%     -6.5%        -21.5%
+6h       rugchk   122        24%    -40.7%        -55.7%
+6h       pass     332        27%    -35.2%        -50.2%
 24h      buy        0          -         -             -
-24h      luzny      6        33%    -21.4%        -36.5%
-24h      pass     198        15%    -62.9%        -77.9%
+24h      luzny      8        38%    -21.2%        -36.2%
+24h      rugchk   120        18%    -62.5%        -77.5%
+24h      pass     322        17%    -62.0%        -77.0%
+grupa 'rugchk' = WSZYSTKIE tokeny z czystym kontraktem (bez Jeva): porownaj z 'luzny', zeby zobaczyc, czy Jev cos dodaje ponad sama kontrole kontraktu.
 grupa 'luzny' = ta sama odpowiedz Jeva oceniona luzniejsza bramka (action buy/watch, organic>=0.50, late<0.80, exit_risk<=4, RISK ok); drugi test.
 
 Kalibracja (wynik po 24h, tylko BUY):
